@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import json, random, socket, asyncio, argparse
+import aioquic, aioquic.asyncio, aioquic.h3.connection
 import webtransport
 
 # Gets the outbound LAN IP address

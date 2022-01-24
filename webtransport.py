@@ -13,6 +13,10 @@ def create_web_transport_protocol(HandlerClass):
       return settings
 
   class WebTransportProtocol(aioquic.asyncio.QuicConnectionProtocol):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._http = self._handler = None
+
     def quic_event_received(self, quic_event): # override
       if isinstance(quic_event, aioquic.quic.events.ProtocolNegotiated):
         self._http = H3ConnectionWithDatagram(self._quic, enable_webtransport=True)
