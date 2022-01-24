@@ -36,6 +36,7 @@ and run Chrome with command line flags
 --ignore-certificate-errors-spki-list=<hash> --origin-to-force-quic-on=localhost:4433
 ```
 If your web server is HTTPS capable, this step can be skipped, and you can use the site HTTPS certificate instead.
+
 4. Run the game WebTransport server with
 ```
 python game_server.py cert.pem cert.key
