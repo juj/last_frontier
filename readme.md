@@ -43,6 +43,11 @@ python game_server.py cert.pem cert.key
 ```
 5. Visit the site `last_frontier.html` on your web server to play.
 
+Known Bugs and Quirks
+=====================
+
+- If you observe bullets to fly through the game characters without colliding, make sure you have the both game client windows actually visible on desktop. The game does collision detection inside requestAnimationFrame() calls, so if one of the clients is not looping rAF(), then it will not process collision either. (this would certainly be fixable, but beyond the scope of this test project)
+
 Credits
 =======
 
