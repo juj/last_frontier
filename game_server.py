@@ -88,11 +88,12 @@ class CowboyHandler:
         # If the given session already has two players, assign the player to a new session.
         if num_connections_in_session(session_id) >= 2:
           session_id = get_new_session_id()
-          print('Existing session full, rerouting player to new session' + str(session_id))
         if not session_id in sessions:
           sessions[session_id] = [None, None]
         self.current_session = sessions[session_id]
         new_player_id = assign_connection_to_session(self.current_session, self)
+
+        print('Player joined session ' + str(session_id) + ' and was assigned player ID ' + str(new_player_id))
 
         # Tell all previous connections that a new client joined
         for i in range(len(self.current_session)):
