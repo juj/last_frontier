@@ -22,10 +22,6 @@ def create_web_transport_protocol(HandlerClass):
         self._http = H3ConnectionWithDatagram(self._quic, enable_webtransport=True)
 
       if self._http:
-        # Send Quic events to client handler
-        if self._handler:
-          self._handler.quic_event_received(quic_event)
-
         # Send H3 events to client handler
         for h3_event in self._http.handle_event(quic_event):
           if isinstance(h3_event, aioquic.h3.events.HeadersReceived):

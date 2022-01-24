@@ -116,9 +116,6 @@ class CowboyHandler:
               self.current_session[i] = None
               broadcast_peer_exited(self.current_session, i)
 
-  def quic_event_received(self, quic_event):
-    pass
-
 def main():
   parser = argparse.ArgumentParser()
   parser.add_argument('certificate')
