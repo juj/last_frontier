@@ -46,10 +46,10 @@ python game_server.py cert.pem cert.key
 Credits
 =======
 
-bg.png from https://www.gamedevmarket.net/asset/scrolling-repeatable-background-canyon/
-bell.mp3, crow.mp3, dead*.wav, reload.mp3, shoot.mp3 from https://pixabay.com/
-Marlboro.ttf and Driftwood.ttf from https://www.1001fonts.com/
-Background music from https://www.youtube.com/watch?v=dDJQ-jqHFm0
-Cowboy character from https://opengameart.org/content/cowboy
-bulletmag.png from https://www.hiclipart.com/free-transparent-background-png-clipart-iaopi
-bullet.png original artwork.
+- bg.png from https://www.gamedevmarket.net/asset/scrolling-repeatable-background-canyon/
+- bell.mp3, crow.mp3, dead*.wav, reload.mp3, shoot.mp3 from https://pixabay.com/
+- Marlboro.ttf and Driftwood.ttf from https://www.1001fonts.com/
+- Background music from https://www.youtube.com/watch?v=dDJQ-jqHFm0
+- Cowboy character from https://opengameart.org/content/cowboy
+- bulletmag.png from https://www.hiclipart.com/free-transparent-background-png-clipart-iaopi
+- bullet.png original artwork.
