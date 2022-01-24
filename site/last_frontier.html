@@ -1,0 +1,675 @@
+<html><head><meta charset="UTF-8">
+<style>
+  @font-face { font-family: titleFont; src: url('assets/Driftwood.ttf'); }
+  @font-face { font-family: baseFont; src: url('assets/Marlboro.ttf'); }
+  body { background: saddlebrown; }
+  #joinGame { background: url('assets/startbg.png'); background-size: cover; background-repeat: no-repeat; background-position: center; position:fixed; height:614px; left: 0%; width: 100%; text-align: center; }
+  #joinInstructions { display:none; font-size: 40px; font-family: baseFont; color: saddlebrown; text-shadow: 3px 3px black; }
+  .unselectable { user-select: none; }
+  h1 { font-size: 80px; font-family: titleFont; color: black; text-shadow: 2px 2px saddlebrown; }
+  #webtransport { display:none; font-size: 40px; font-family: baseFont; color: saddlebrown; text-shadow: 3px 3px black; }
+  #opponentHasQuit { display:none; position:fixed; width: 100%; bottom:40%; text-align: center; font-size: 40px; font-family: baseFont; color: saddlebrown; text-shadow: 2px 2px black; }
+  #gameStart { display:none; position:fixed; width: 100%; bottom:40%; text-align: center; font-size: 40px; font-family: baseFont; color: saddlebrown; text-shadow: 2px 2px black; }
+</style>
+</head>
+<body>
+
+<div id='joinGame'>
+  <h1 class="unselectable">Last Frontier</h1>
+  <div id='joinInstructions'>
+    <span class="unselectable">Share this URL with your friend to play:<br></span>
+    <span id='gameUrl' onclick="selectText('gameUrl')"></span>
+  </div>
+  <span id='webtransport'></span>
+</div>
+<span id='opponentHasQuit'>
+  Your yellow belly opponent has gone lighting shucks.<br>
+  Looks like you made your jack one time too many.<br>
+  (your opponent quit)
+</span>
+<span id='gameStart'>
+  Two bad eggs, still above snakes.<br>
+  One of 'em, the six-singer soon takes.<br>
+  <span id='gameStartCounter'><br></span>
+</span>
+
+<script src='webgl.js'></script>
+
+<script>
+/* The networking aspects of the game are implemented in a "cooperative" authority manner, in the style that
+ peer-to-peer games sometimes work. This is a bit unconventional in games, since it forfeits any possibility
+ to do cheat detection - but for a game like this, it doesn't matter. The reason for this structure is to be
+ able to symmetrically observe WebTransport network latency effects on both ends.
+
+ In this structure, both players have authority over their own positions on the game area, and how many bullets
+ they have left in their magazines. Player 0 hit detects the bullets that player 1 shot against them, and vice versa. */
+
+// Global table of the two cowboys and their bullets, id -> object.
+const objects = {};
+
+const gameWidth = 800;
+const gameHeight = 450;
+
+// Spawn counter for new bullets in the game. Both players have their own "ID space" to safely/cooperatively
+// spawn bullets into.
+let bulletSpawnIdCounter;
+
+// What is the object ID of our side (either 0 or 1)
+let localPlayerId = 0;
+
+// The game session id (in URL search ?game=sessionId field)
+let sessionId = 0;
+
+// How many shots we have left in our revolver. This field is not synced over the network, both players keep
+// a track of it locally.
+let ammoLeft = 6;
+
+// Both player kill scores. This field is not synced over the network, both players independently keep count.
+const playerScores = [0, 0];
+
+// Players cannot yet move during the initial fight intro sequence.
+let fightIntroSequenceRunning = true;
+
+// setTimeout() event callback ID for when local player is reloading.
+let playerReloadingTimeoutEvent = null;
+
+// Do network transfers of all game sprites so they are available during the game.
+const assets = ['bg', 'bullet', 'bulletmag', 'dead', 'idle0', 'idle1', 'idle2', 'idle3',
+  'idlenogun0', 'idlenogun1', 'idlenogun2', 'idlenogun3', 'shoot0', 'shoot1', 'shoot2', 'shoot3',
+  'walk0', 'walk1', 'walk2', 'walk3', 'walknogun0', 'walknogun1', 'walknogun2', 'walknogun3'];
+for(let f of assets) preloadImages([`assets/${f}.png`]);
+
+// WebTransport connection to game server.
+let wt = null;
+
+// JSON serialization and deserialization to binary.
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+
+const urlSearchParams = new URLSearchParams(window.location.search);
+
+// If true, spams low-level network connection debug info to console.
+let DEBUGLOG = false;
+
+function debugLog(msg, channel) {
+  if (!DEBUGLOG) return;
+  if (channel == 'error') console.error(msg);
+  else if (channel == 'warn') console.warn(msg);
+  else console.log(msg);
+}
+
+// Sends the given JSON object over to the server. Each sent JSON must have a 'cmd' field that specify
+// what the game message is that is being sent.
+function sendToNetwork(json) {
+  // For simplicity, the game uses JSON data as the game messages over the wire. This is not a smart thing
+  // to do, but for a naively simple game that would otherwise not generate much network load to be
+  // representative of actual games, it conveniently generates some more network traffic.
+  wt.datagramWriter.write(textEncoder.encode(JSON.stringify(json)));
+  // websocket.send(JSON.stringify(json));
+}
+
+function showConnectLog(msg) {
+  const log = document.getElementById('webtransport');
+  log.style.display = msg.length ? 'inline' : 'none';
+  log.innerHTML = msg;
+}
+
+function connectToServer() {
+  showConnectLog('Connecting to WebTransport server...');
+
+  // If WebTransport is not supported, show an error message (and let the code throw on the next line)
+  if (typeof WebTransport === 'undefined') showConnectLog('Sorry, this browser does not support WebTransport!<br>(Try Chrome 97 or newer)');
+
+  const url = `https://${location.hostname}:4433/`;
+  wt = new WebTransport(url);
+
+  wt.ready.then(() => {
+    showConnectLog('');
+    console.error(`WebTransport connection ready to address ${url}`);
+    // Grab Datagram reader and writer objects
+    const datagramReader = wt.datagrams.readable.getReader();
+    wt.datagramWriter = wt.datagrams.writable.getWriter(); // store on the WebTransport object for convenient use later.
+    // Tell the game server we want to join a game session, either a new random generated one,
+    // or the one specified on the URL ?game=id line.
+    sendToNetwork({'cmd': 'joinSession', 'session': urlSearchParams.get('game') });
+
+    // Start a datagram receive callback chain.
+    function receiveDatagram(data) {
+      debugLog(`WebTransport RECV ${textDecoder.decode(data.value)}`);
+      processReceivedNetworkMessage(JSON.parse(textDecoder.decode(data.value)));
+      datagramReader.read().then(receiveDatagram);
+    }
+    datagramReader.read().then(receiveDatagram);
+  }).catch((e) => {
+    showConnectLog(`Failed to connect to WebTransport server at <br>${url}<br>${e}<br>Maybe the server is offline?<br>See browser console log for more details.`);
+    console.error(e);
+  });
+
+  wt.closed.then(() => {
+    console.error(`WebTransport connection to ${url} closed`);
+  });
+}
+
+// Returns [x, y, direction] coordinates of the given player's starting position at each game round.
+function playerStartingPosition(playerId) {
+  return [gameWidth * (playerId ? 5 : 1) / 6, gameHeight / 2, playerId ? -1 : 1];
+}
+
+// Applies received gameplay messages to the local game state.
+function processReceivedNetworkMessage(msg) {
+  switch(msg.cmd) {
+    // Server tells that we have successfully joined a new or existing game sesssion.
+    case 'joinedSession':
+      // Server has assigned us a player ID and a sesion ID, store those for later use.
+      localPlayerId = msg.playerId;
+      sessionId = msg.sessionId;
+      console.log(`Joined session ${sessionId}`);
+
+      // Initialize spawn counter so that both players shoot bullets in their own unique ID spaces.
+      bulletSpawnIdCounter = 1000 + 100000*localPlayerId;
+
+      // Show game join instructions on screen.
+      const url = `${location.origin}${location.pathname}?game=${sessionId}`;
+      document.getElementById('gameUrl').innerText = url;
+      document.getElementById('joinInstructions').style.display = 'block';
+      window.history.replaceState({}, document.title, `${location.origin}${location.pathname}`);
+
+      // Spawn our game character on screen.
+      const [x, y, direction] = playerStartingPosition(localPlayerId);
+      const player = spawnPlayer(localPlayerId, x, y, direction, /*remoteObject=*/false);
+      sendSpawnPlayer(localPlayerId, player);
+      break;
+
+    // Another player has joined, replicate the world state for them.
+    case 'playerJoined':
+      sendWorldState();
+      sendToNetwork({ cmd: 'gameStarted' });
+      newGameStarted();
+      break;
+
+    // Network tells us to spawn the opponent player character at some position.
+    case 'spawnPlayer':
+      spawnPlayer(msg.playerId, msg.x, msg.y, msg.direction, /*remoteObject=*/true);
+      break;
+
+    // Network tells us to spawn an opponent bullet at some position.
+    case 'spawnBullet':
+      spawnBullet(msg.id, msg.x, msg.y, msg.direction, msg.playerId, /*remoteObject=*/true);
+      break;
+
+    // Network tells us to delete a bullet from screen.
+    case 'deleteObject':
+      deleteObject(msg.id);
+      break;
+
+    // Network tells us to set a new position for an object.
+    case 'move':
+      moveObject(msg);
+      break;
+
+    // Network tells that the opponent player has hit a bullet and died.
+    case 'playerDied':
+      playerDied(objects[msg.id]);
+      break;
+
+    // New game can start.
+    case 'gameStarted':
+      newGameStarted();
+      break;
+
+    // Remote tells that player shoots: this is a visual cue only, that triggers the shoot animation
+    // on the opponent character.
+    case 'playerShoots':
+      playerShoots(msg);
+      break;
+
+    // The opponent player has left the game field.
+    case 'playerQuit':
+      deleteObject(msg.playerId);
+      document.getElementById('opponentHasQuit').style.display = 'inline';
+      break;
+  }
+}
+
+function sendWorldState() {
+  // At this stage of the game, we only have our local game character on the game field.
+  // However in case the game is expanded in the future to allow hot re-join of a live game,
+  // this loop implements a full game state sync.
+  for(let i in objects) {
+    let o = objects[i];
+    if (o.remoteObject) continue;
+    if (o.bullet) sendSpawnBullet(i, o.x, o.y, o.direction, localPlayerId);
+    else sendSpawnPlayer(localPlayerId, o);
+  }
+}
+
+function sendSpawnPlayer(playerId, object) {
+  sendToNetwork({
+    cmd: 'spawnPlayer',
+    playerId: playerId,
+    x: object.x,
+    y: object.y,
+    direction: object.scaleX,
+  });
+}
+
+function playerShoots(cmd) {
+  setNewAnimState(objects[cmd.playerId], 'shoot');
+}
+
+function sendPlayerShoots(player) {
+  sendToNetwork({
+    cmd: 'playerShoots',
+    playerId: player.playerId,
+  });
+}
+
+function spawnPlayer(playerId, x, y, direction, remoteObject) {
+  return objects[playerId] = {
+    x: x,
+    y: y,
+    img: 'assets/idle0.png',
+    scaleX: direction,
+    r: 1,
+    g: 1,
+    b: 1,
+    a: 1,
+    remoteObject: remoteObject,
+    animationTimer: 0,
+    animationFrame: 0,
+    animState: animStates['idle'],
+    playerId: playerId
+  };
+}
+
+function moveObject(msg) {
+  const o = objects[msg.id];
+  if (!o) return;
+  o.x = msg.x;
+  o.y = msg.y;
+  o.scaleX = msg.scaleX;
+  if (!o.bullet) setPlayerWalking(o, true);
+}
+
+function sendMoveObject(objectId) {
+  sendToNetwork({
+    cmd: 'move',
+    id: objectId,
+    x: objects[objectId].x,
+    y: objects[objectId].y,
+    scaleX: objects[objectId].scaleX,
+  });
+}
+
+function newGameStarted() {
+  // Start the requestAnimationFrame() loop, game is now on.
+  animate(frame);
+
+  const gameStart = document.getElementById('gameStart');
+  const gameStartCounter = document.getElementById('gameStartCounter');
+
+  // Hide the join banner and show the game WebGL canvas.
+  document.getElementById('joinGame').style.display = 'none';
+  document.querySelector('canvas').style.display = 'block';
+
+  // Show the game start intro sequence.
+  gameStart.style.display = 'inline';
+
+  setTimeout(() => {
+    playAudio('assets/crow.mp3');
+    gameStartCounter.innerText = '3';
+  }, 2000);
+
+  setTimeout(() => {
+    playAudio('assets/crow.mp3');
+    gameStartCounter.innerText = '2';
+  }, 3000);
+
+  setTimeout(() => {
+    playAudio('assets/crow.mp3');
+    gameStartCounter.innerText = '1';
+  }, 4000);
+
+  setTimeout(() => {
+    playAudio('assets/bell.mp3');
+    gameStartCounter.innerText = '';
+    gameStart.style.fontSize = '120px';
+    gameStart.innerText = 'FIGHT';
+    fightIntroSequenceRunning = false;
+  }, 5000);
+
+  setTimeout(() => {
+    gameStart.style.display = 'none';
+  }, 6000);
+
+  // Remove the ?game=id from the URL search part, since reloading the page won't currently
+  // hot-join a game in progress, but should start a new game pair session.
+  window.history.replaceState({}, document.title, location.origin + location.pathname);
+
+  // Before quitting a page, tell the peer that the client quits. TODO: This is something
+  // that we are doing only because I could not figure out how to get a peer quit event
+  // in the aioquic library, see https://groups.google.com/a/chromium.org/g/web-transport-dev/c/jjaVH0KXRhM
+  // If such an event exists, then it would be better for the server to send these messages
+  // when it detects a closed connection, as that would be more robust.
+  window.addEventListener('beforeunload', () => {
+    sendToNetwork({
+      cmd: 'playerQuit',
+      playerId: localPlayerId
+    });
+  });
+}
+
+function sendSpawnBullet(id, x, y, direction, playerId) {
+  sendToNetwork({
+    cmd: 'spawnBullet',
+    id: id,
+    x: x,
+    y: y,
+    scaleX: 1,
+    direction: direction,
+    playerId: playerId
+  });
+}
+
+function deleteObject(id) {
+  delete objects[id];
+}
+
+function sendDeleteObject(id) {
+  sendToNetwork({
+    cmd: 'deleteObject',
+    id: id
+  });
+}
+
+function spawnBullet(id, x, y, direction, playerId, remoteObject) {
+  playAudio('assets/shoot.mp3', 0.6);
+  objects[id] = {
+    x: x,
+    y: y,
+    direction: direction,
+    img: 'assets/bullet.png',
+    r: playerId ? 1 : 0,
+    g: 0,
+    b: playerId ? 0 : 1,
+    a: 1,
+    bullet: true,
+    scaleX: 1,
+    remoteObject: remoteObject,
+    playerId: playerId
+  };
+}
+
+// Starts a new animation sequence on the given character.
+function setNewAnimState(o, newState) {
+  o.animState = animStates[newState];
+  o.animationTimer = o.animationFrame = 0;
+  o.img = o.animState.filename.replace('%', o.animationFrame);
+}
+
+function setPlayerWalking(o, walking) {
+  if (walking) {
+    if (o.animState.name == 'idle') setNewAnimState(o, 'walk');
+    if (o.animState.name == 'idlenogun') setNewAnimState(o, 'walknogun');
+  } else {
+    if (o.animState.name == 'walk') setNewAnimState(o, 'idle');
+    if (o.animState.name == 'walknogun') setNewAnimState(o, 'idlenogun');
+  }
+}
+
+function setPlayerReloading(o, reloading) {
+  if (reloading) {
+    if (o.animState.name == 'idle' || o.animState.name == 'shoot') setNewAnimState(o, 'idlenogun');
+    if (o.animState.name == 'walk') setNewAnimState(o, 'walknogun');
+  } else {
+    if (o.animState.name == 'idlenogun') setNewAnimState(o, 'idle');
+    if (o.animState.name == 'walknogun') setNewAnimState(o, 'walk');
+  }
+}
+
+function playerDied(o) {
+  if (o.animState.name != 'dead') {
+    setNewAnimState(o, 'dead');
+    playAudio(`assets/dead${Math.floor(Math.random()*4)}.wav`);
+    ++playerScores[1-o.playerId];
+    if (o.playerId == localPlayerId) {
+      // When the player respawns, they will have 6 ammo again.
+      ammoLeft = 6;
+    }
+  }
+}
+
+function sendPlayerDied(o) {
+  sendToNetwork({
+    cmd: 'playerDied',
+    id: o.playerId
+  });
+}
+
+function playerInput(t, dt) {
+  const player = objects[localPlayerId];
+  if (!player || fightIntroSequenceRunning || player.animState.name == 'dead') return;
+
+  let playerMoved = false;
+  const playerSpeed = dt * 0.15;
+  if (getKeyState('ArrowLeft') > 0) {
+    player.x = Math.max(0, player.x - playerSpeed);
+    player.scaleX = -1;
+    playerMoved = true;
+  }
+  if (getKeyState('ArrowRight') > 0) {
+    player.x = Math.min(gameWidth, player.x + playerSpeed);
+    player.scaleX = 1;
+    playerMoved = true;
+  }
+  if (getKeyState('ArrowUp') > 0) {
+    const gamePlayAreaHeight = 287;
+    player.y = Math.min(gamePlayAreaHeight, player.y + playerSpeed);
+    playerMoved = true;
+  }
+  if (getKeyState('ArrowDown') > 0) {
+    player.y = Math.max(0, player.y - playerSpeed);
+    playerMoved = true;
+  }
+
+  setPlayerWalking(player, playerMoved);
+
+  if (playerMoved) {
+    sendMoveObject(localPlayerId);
+  }
+
+  if (getKeyState('Space') == 1) {
+    if (ammoLeft > 0) {
+      --ammoLeft;
+      const id = bulletSpawnIdCounter++;
+      const shootDirection = (1 - player.scaleX) * Math.PI * 0.5 + (Math.random() - 0.5) * 0.1;
+      spawnBullet(id, player.x, player.y, shootDirection, localPlayerId, /*remoteObject=*/false);
+      sendSpawnBullet(id, player.x, player.y, shootDirection, localPlayerId);
+      setNewAnimState(player, 'shoot');
+      sendPlayerShoots(player);
+      if (ammoLeft == 0) {
+        setTimeout(() => {
+          playAudio('assets/reload.mp3');
+          setPlayerReloading(player, true);
+          playerReloadingTimeoutEvent = setTimeout(() => {
+            setPlayerReloading(player, false);
+            ammoLeft = 6;
+          }, 3000);
+        }, 400);
+      }
+    }
+  }
+}
+
+function resetPlayerPositions() {
+  // Player 0 shall reset both player positions, and broadcast to player 1.
+  if (localPlayerId == 0) {
+    console.log('resetPlayerPositions player0 acts');
+    if (objects[0]) {
+      [objects[0].x, objects[0].y, objects[0].scaleX] = playerStartingPosition(0);
+      sendMoveObject(0);
+    }
+    if (objects[1]) {
+      [objects[1].x, objects[1].y, objects[1].scaleX] = playerStartingPosition(1);
+      sendMoveObject(1);
+    }
+  }
+  if (objects[0]) setNewAnimState(objects[0], 'idle');
+  if (objects[1]) setNewAnimState(objects[1], 'idle');
+  // Clear all bullets for next round
+  for(let i in objects) {
+    if (objects[i].bullet) {
+      delete objects[i];
+      sendDeleteObject(i);
+    }
+  }
+  ammoLeft = 6;
+  clearTimeout(playerReloadingTimeoutEvent);
+}
+
+// Player animation state machine: list all animation sequences and their properties
+const animStates = {
+  'idle':      { 'name': 'idle', 'duration': 300, 'count': 4, 'loop': true, 'filename': 'assets/idle%.png' },
+  'idlenogun': { 'name': 'idlenogun', 'duration': 300, 'count': 4, 'loop': true, 'filename': 'assets/idlenogun%.png' },
+  'walk':      { 'name': 'walk', 'duration': 200, 'count': 4, 'loop': true, 'filename': 'assets/walk%.png' },
+  'walknogun': { 'name': 'walknogun', 'duration': 200, 'count': 4, 'loop': true, 'filename': 'assets/walknogun%.png' },
+  'shoot':     { 'name': 'shoot', 'duration': 100, 'count': 4, 'loop': false, 'filename': 'assets/shoot%.png', 'transition': 'idle' },
+  'dead':      { 'name': 'dead', 'duration': 3000, 'count': 1, 'loop': false, 'filename': 'assets/dead.png', 'transition': 'idle',
+                 'transitionFunc':resetPlayerPositions },
+}
+
+function animatePlayerSprite(s, dt) {
+  // Advance the current animation's timer.
+  s.animationTimer += dt;
+  if (s.animationTimer >= s.animState.duration) { // Time to progress to next frame of the current animation sequence?
+    s.animationTimer = s.animationTimer % s.animState.duration;
+    if (++s.animationFrame >= s.animState.count) { // Current animation sequence finished altogether?
+      // Loop the current animation sequence, or transition to the next animation sequence.
+      s.animationFrame = 0;
+      if (s.animState.transitionFunc) s.animState.transitionFunc(s);
+      // Remote player does not loop walk animation (since we don't send an "transitioned-to-idle" network state over server)
+      if (s.remoteObject && (s.animState.name == 'walk' || s.animState.name == 'walknogun')) setPlayerWalking(s, false);
+      else if (!s.animState.loop) s.animState = animStates[s.animState.transition];
+    }
+    s.img = s.animState.filename.replace('%', s.animationFrame);
+  }
+}
+
+function frame(t, dt) {
+  // Process local player input
+  playerInput(t, dt);
+
+  // Move all local bullets (remote player spawned bullets will be moved by the remote player)
+  const dtScale = dt * 0.4;
+  for(let i in objects) {
+    const o = objects[i];
+    if (o.bullet && !o.remoteObject) {
+      o.x += Math.cos(o.direction) * dtScale;
+      o.y += Math.sin(o.direction) * dtScale;
+
+      if (o.x < 0 || o.x > screenWidth()) {
+        // Despawn bullets that are out of screen.
+        delete objects[i];
+        sendDeleteObject(i);
+      } else {
+        // Send object move commands for objects that have moved.
+        sendMoveObject(i);
+      }
+    }
+  }
+
+  const scale = screenWidth() / gameWidth;
+
+  // Draw background
+  var bgScale = Math.max(screenWidth() / 700, screenHeight() / 400);
+  drawImage('assets/bg.png', screenWidth()/2, 0, bgScale, bgScale, 0.5);
+
+  // Keep track of player and bullet rectangles for collision detection
+  const playerRects = [];
+  const bulletRects = [];
+
+  // Draw objects
+  for(let i in objects) {
+    const o = objects[i];
+    if (!o.bullet) {
+      animatePlayerSprite(o, dt);
+      const offsetY = (o.animState.name == 'dead') ? -0.1 : -0.5;
+      drawShadowImage(o.img, o.x*scale, o.y*scale, scale * o.scaleX, scale*-1, 0.5, offsetY, 0, 0, 0, 0.5);
+    }
+    const rect = drawImage(o.img, o.x*scale, o.y*scale, scale * o.scaleX, scale, 0.5, 0.5, o.r, o.g, o.b, o.a);
+    rect.object = o;
+    rect.id = i;
+
+    // Store drawn rectangles for collision detection
+    if (o.bullet) bulletRects.push(rect);
+    else playerRects.push(rect);
+  }
+
+  // Collision detection scheme: each player tests the remote bullets against the local player sprite.
+  // This way network latency will err in fairness towards the player that is taking the bullets, not
+  // the player that is shooting.
+
+  // N.b. this does have an interesting adverse effect since we essentially do collision detection inside
+  // requestAnimationFrame(), then if one of the players is afk with their browser tab minimized, then
+  // they will become immune, since their rAF() will not run, and they will never process incoming
+  // bullet collisions.
+
+  for(let pl of playerRects) {
+    if (pl.object.remoteObject) continue;
+
+    for(let b of bulletRects) {
+      if (pl.object.playerId != b.object.playerId) {
+        if (objectsCollide(pl, b)) {
+          playerDied(pl.object);
+          sendPlayerDied(pl.object);
+          delete objects[b.id];
+          sendDeleteObject(b.id);
+          break;
+        }
+      }
+    }
+  }
+
+  // Draw # of bullets left HUD
+  const x = screenWidth() * 0.84 - 250;
+  for(let i = 0; i < ammoLeft; ++i) {
+    drawImage('assets/bulletmag.png', x + i * scale * 30, screenHeight()-20, scale*0.25, undefined, 0, 1.0);
+  }
+
+  // Draw scores in HUD
+  if (playerScores[0] != 0 || playerScores[1] != 0) {
+    drawText(playerScores[0]+'', 30, screenHeight()-125, 120, 'titleFont', 0, 0, 1, 1);
+    drawText(playerScores[1]+'', screenWidth()-150, screenHeight()-125, 120, 'titleFont', 1, 0, 0, 1);
+  }
+}
+
+// http://stackoverflow.com/questions/985272/selecting-text-in-an-element-akin-to-highlighting-with-your-mouse
+function selectText(element) {
+  var doc = document, text = doc.getElementById(element), range, selection;
+  if (doc.body.createTextRange) {
+      range = document.body.createTextRange();
+      range.moveToElementText(text);
+      range.select();
+  } else if (window.getSelection) {
+      selection = window.getSelection();
+      range = document.createRange();
+      range.selectNodeContents(text);
+      selection.removeAllRanges();
+      selection.addRange(range);
+  }
+}
+
+window.addEventListener('load', () => {
+  connectToServer();
+  if (!urlSearchParams.get('nobgmusic')) playAudio('assets/bgmusic.mp3', 0.25);
+});
+
+// Browser resize handling. (Some smart CSS styles might obviate this)
+function resizeBg() {
+  document.getElementById('joinGame').style.bottom = `${(window.innerHeight - 614) / 2}px`;
+}
+window.addEventListener('resize', resizeBg);
+resizeBg();
+
+</script>
+</body></html>
